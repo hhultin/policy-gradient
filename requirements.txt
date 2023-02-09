@@ -1,0 +1,6 @@
+gym==0.21.0
+matplotlib==3.5.2
+numpy==1.23.2
+pandas==1.4.4
+stable_baselines3==1.6.0
+torch==1.12.1+cu113
