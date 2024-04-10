@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import os
 import pickle
 import copy
 
@@ -7,7 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-torch.set_default_dtype(torch.float64)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+torch.set_default_dtype(torch.float32)
 
 
 def parse_args():
@@ -21,10 +23,10 @@ def parse_args():
     parser.add_argument('--num_iterations', type=int, default=int(1e5))
     parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--num_evaluate', type=int, default=int(1e5))
+    parser.add_argument('--device', type=str, default="-1", choices=["0", "1", "-1"])
     parser.add_argument('--gradient_type', type=str, default="complete", choices=["complete", "naive"])
     parser.add_argument('--cost_type', type=str, default="forsyth", choices=["linear", "forsyth"])
-    parser.add_argument('--objective', type=str, default="forsyth", choices=["cost", "forsyth", "exponential"])
-    parser.add_argument('--gamma', type=float, default=200.0)
+    parser.add_argument('--objective', type=str, default="cost", choices=["cost", "exponential"])
     parser.add_argument('--exp_param', type=float, default=0.1)
 
     return parser.parse_args()
@@ -63,12 +65,7 @@ def compute_objective(endvals, args, using_torch=True):
     :param using_torch: boolean of whether to use torch or numpy
     :return: array of values of the objective function
     """
-    if args.objective == "forsyth":
-        if using_torch:
-            gs = torch.square(endvals - args.gamma / 2)
-        else:
-            gs = np.square(endvals - args.gamma / 2)
-    elif args.objective == "cost":
+    if args.objective == "cost":
         gs = args.s0 * args.alpha0 - endvals
     elif args.objective == "exponential":
         if using_torch:
@@ -116,7 +113,7 @@ def step(a, s, b, alpha, args, using_torch):
         with torch.no_grad():
             s1 = (s * (1 + args.kp_s * a) + args.kp_0 * a) * torch.exp(
                 (args.eta - args.sigma * args.sigma / 2) * args.dt + args.sigma * np.sqrt(args.dt) * torch.randn(
-                    s.shape, dtype=s.dtype))
+                    s.shape, dtype=s.dtype, device=s.device))
     else:
         if type(s) == np.ndarray:
             w = np.random.standard_normal(s.shape)
@@ -196,6 +193,9 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed + 1)
 
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.device
+    device = "cpu" if args.device == "-1" else "cuda"
+
     # Define problem setup variables
     timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     args = add_parameters(args)
@@ -206,8 +206,8 @@ def main(args):
     torch_policy_models = []
     best_models = [None] * args.num_runs
     num_iterations = []
-    loss_transitions = torch.zeros(args.num_runs, args.num_iterations)
-    objective_training = torch.zeros(args.num_runs, args.num_iterations, args.batch_size)
+    loss_transitions = torch.zeros(args.num_runs, args.num_iterations, device=device)
+    objective_training = torch.zeros(args.num_runs, args.num_iterations, args.batch_size, device=device)
 
     prob_num_vars = (2, 1)
     prob_params_sgd = [np.zeros((args.num_runs, args.num_iterations + 1, p)) for p in prob_num_vars]
@@ -222,12 +222,12 @@ def main(args):
         best_gs = torch.inf
 
         # Setup optimization of policy variables
-        policy = setup_model()
+        policy = setup_model().to(device)
         torch_policy_models.append(policy)
         opt_policy = torch.optim.Adam(policy.parameters())
 
         # Setup optimization of transition variables
-        transition_params = [torch.tensor(p[i, 0, :], requires_grad=True, ) for p in prob_params_sgd]
+        transition_params = [torch.tensor(p[i, 0, :], device=device, requires_grad=True, ) for p in prob_params_sgd]
         opt_transition = torch.optim.Adam(transition_params, lr=1e-2)
 
         for it in range(args.num_iterations):
@@ -240,14 +240,15 @@ def main(args):
                     print('transition params: ', transition_params)
 
             # Simulate episodes
-            prices = args.s0 * torch.ones(args.batch_size)
-            cash = torch.zeros(args.batch_size)
-            quantity = args.alpha0 * torch.ones(args.batch_size)
-            logp = torch.zeros(args.batch_size)
+            prices = args.s0 * torch.ones(args.batch_size, device=device)
+            cash = torch.zeros(args.batch_size, device=device)
+            quantity = args.alpha0 * torch.ones(args.batch_size, device=device)
+            logp = torch.zeros(args.batch_size, device=device)
             for t in range(args.n):
                 actions = policy(
-                    torch.stack([(t / args.n) * torch.ones(args.batch_size), (prices - args.s0) / args.s0, quantity],
-                                axis=-1)).squeeze()
+                    torch.stack(
+                        [(t / args.n) * torch.ones(args.batch_size, device=device), (prices - args.s0) / args.s0,
+                         quantity], axis=-1)).squeeze()
                 actions = - (1 / (1 + torch.exp(-actions))) * quantity
                 new_prices, cash, quantity = step(actions, prices, cash, quantity, args, using_torch=True)
                 mean_params = mean_function(prices, actions, transition_params[0], args)
@@ -301,21 +302,21 @@ def main(args):
             loss_transitions[i, it] = loss_transition.detach()
             objective_training[i, it, :] = gs.detach()
             for p in range(len(prob_params_sgd)):
-                prob_params_sgd[p][i, it + 1, :] = transition_params[p].detach().numpy()
+                prob_params_sgd[p][i, it + 1, :] = transition_params[p].cpu().detach().numpy()
 
             if not it % 500:
                 print("evaluation")
                 print('# evals since current best: ', best_count)
                 print("best objective before: ", best_gs)
                 # Simulate episodes
-                prices = args.s0 * torch.ones(args.num_evaluate)
-                cash = torch.zeros(args.num_evaluate)
-                quantity = args.alpha0 * torch.ones(args.num_evaluate)
+                prices = args.s0 * torch.ones(args.num_evaluate, device=device)
+                cash = torch.zeros(args.num_evaluate, device=device)
+                quantity = args.alpha0 * torch.ones(args.num_evaluate, device=device)
                 for t in range(args.n):
                     actions = policy(
                         torch.stack(
-                            [(t / args.n) * torch.ones(args.num_evaluate), (prices - args.s0) / args.s0, quantity],
-                            axis=-1)).squeeze()
+                            [(t / args.n) * torch.ones(args.num_evaluate, device=device), (prices - args.s0) / args.s0,
+                             quantity], axis=-1)).squeeze()
                     actions = - (1 / (1 + torch.exp(-actions))) * quantity
                     prices, cash, quantity = step(actions, prices, cash, quantity, args, using_torch=True)
                 new_gs = torch.mean(compute_objective(end_value(prices, cash, quantity, args, using_torch=True), args))

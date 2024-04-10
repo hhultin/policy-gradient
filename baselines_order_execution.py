@@ -75,7 +75,7 @@ def main(args):
         print('Gain: ', torch.mean(endvals[j, :]).item())
         print('Std: ', torch.std(endvals[j, :]).item())
 
-    # Saving the results for the TWAP strategy
+    # Saving the results for the no trading strategy
     data_dict = args.__dict__
     data_dict["endvals"] = endvals
     pickle.dump(data_dict,
@@ -105,7 +105,7 @@ def main(args):
         print('Gain: ', torch.mean(endvals[j, :]).item())
         print('Std: ', torch.std(endvals[j, :]).item())
 
-    # Saving the results for the TWAP strategy
+    # Saving the results for the all trading strategy
     data_dict = args.__dict__
     data_dict["endvals"] = endvals
     pickle.dump(data_dict,

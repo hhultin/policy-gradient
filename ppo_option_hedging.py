@@ -23,8 +23,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--num_evaluate', type=int, default=int(1e5))
     parser.add_argument('--device', type=str, default="0", choices=["0", "1", "-1"])
-    parser.add_argument('--objective', type=str, default="forsyth", choices=["cost", "forsyth", "exponential"])
-    parser.add_argument('--gamma', type=float, default=0.0)
+    parser.add_argument('--objective', type=str, default="cost", choices=["cost", "exponential"])
     parser.add_argument('--exp_param', type=float, default=2e-7)
     return parser.parse_args()
 
@@ -41,10 +40,11 @@ class HedgingVecEnv(VecEnv):
         self.shares = None
         self.balance = None
         self.price = None
+        self.value = None
         self.args = args
         self.num_envs = num_envs
 
-        self.action_space = gym.spaces.Box(low=args.amin, high=args.amax, shape=(1,))
+        self.action_space = gym.spaces.Box(low=-1e3, high=1e3, shape=(1,))
         low = -np.inf * np.ones(3)
         high = np.inf * np.ones(3)
         self.observation_space = gym.spaces.Box(low=low, high=high)
@@ -58,34 +58,37 @@ class HedgingVecEnv(VecEnv):
 
     def step(self, action):
         action = action.squeeze()
+        action = (self.args.amax - self.args.amin) / (1 + np.exp(-self.args.sigmoid_param * action)) + self.args.amin
         done = False
         s1, b1, alpha1 = step(self.price, self.balance, self.shares, action, self.args, using_torch=False)
-        if self.args.objective == "cost":
-            reward = (b1 - self.balance) / self.args.units
-        else:
-            reward = np.zeros_like(self.balance)
+        v1 = compute_objective(end_value(alpha1, s1, b1, self.args, using_torch=False), self.args, using_torch=False)
+        reward = -v1 + self.value
         self.current_step += 1
         self.price = s1
         self.balance = b1
         self.shares = alpha1
+        self.value = v1
         if self.current_step[0] == self.args.n:
             endval = end_value(self.shares, self.price, self.balance, self.args, using_torch=False)
-            if self.args.objective == "cost":
-                reward += (endval - self.balance) / self.args.units
-            else:
-                reward = - compute_objective(endval, self.args, using_torch=False)
+            reward += -compute_objective(endval, self.args, using_torch=False) + self.value
             self.shares *= 0
             self.balance = endval
             done = True
-
-        return self._get_observation(), reward, done * np.ones(self.num_envs, dtype=self.dtype), [{} for _ in
-                                                                                                  range(self.num_envs)]
+            last_obs = self._get_observation()
+            infos = [{"terminal_observation": last_obs[i, :]} for i in range(self.num_envs)]
+            obs = self.reset()
+        else:
+            infos = [{} for _ in range(self.num_envs)]
+            obs = self._get_observation()
+        return obs, reward.astype(self.dtype), done * np.ones(self.num_envs, dtype=self.dtype), infos
 
     def reset(self):
         self.price = self.args.s0 * np.ones(self.num_envs, dtype=self.dtype)
         self.balance = self.args.cash0 * np.ones(self.num_envs, dtype=self.dtype)
         self.shares = self.args.alpha0 * np.ones(self.num_envs, dtype=self.dtype)
         self.current_step = 0 * np.ones(self.num_envs, dtype=self.dtype)
+        self.value = compute_objective(end_value(self.shares, self.price, self.balance, self.args, using_torch=False),
+                                       self.args, using_torch=False)
         return self._get_observation()
 
     def close(self):
@@ -133,7 +136,7 @@ def main(args):
     num_timesteps = []
 
     for j in range(args.num_runs):
-        # Stop training if there is no improvement after more than 10 evaluations
+        # Stop training if there is no improvement after more than 5 evaluations
         stop_train_callback = StopTrainingOnNoModelImprovement(max_no_improvement_evals=5, verbose=1)
         eval_callback = EvalCallback(eval_env, eval_freq=args.n * 500,
                                      best_model_save_path="./results/models/ppo_hedging_{}_{}".format(timestamp, j),
@@ -141,21 +144,23 @@ def main(args):
                                      n_eval_episodes=args.num_evaluate, callback_after_eval=stop_train_callback)
         models.append(
             PPO("MlpPolicy", env, verbose=1, gamma=1, batch_size=args.batch_size,
-                tensorboard_log="./ppo_tensorboard/", n_steps=args.n, n_epochs=1))
+                tensorboard_log="./ppo_hedging_tensorboard/", n_steps=args.n, n_epochs=1, learning_rate=3e-5))
+        print(models[-1].policy)
         models[-1].learn(total_timesteps=args.n * args.num_iterations * args.batch_size, callback=eval_callback,
                          log_interval=100)
+        models[-1].set_parameters("./results/models/ppo_hedging_{}_{}/best_model.zip".format(timestamp, j))
         num_timesteps.append(models[-1].num_timesteps)
         models[-1].save("./results/models/ppo_hedging_{}_{}/best_model".format(timestamp, j))
 
     print('EVALUATION')
-    prices = np.zeros((args.num_runs, args.n + 1, args.num_evaluate))
+    prices = np.zeros((args.num_runs, args.n + 1, args.num_evaluate), dtype=np.float32)
     prices[:, 0, :] = args.s0
-    cash = np.zeros((args.num_runs, args.n + 1, args.num_evaluate))
+    cash = np.zeros((args.num_runs, args.n + 1, args.num_evaluate), dtype=np.float32)
     cash[:, 0, :] = args.cash0
-    quantity = np.zeros((args.num_runs, args.n + 1, args.num_evaluate))
+    quantity = np.zeros((args.num_runs, args.n + 1, args.num_evaluate), dtype=np.float32)
     quantity[:, 0, :] = args.alpha0
-    endvals = np.zeros((args.num_runs, args.num_evaluate))
-    gs = np.zeros(args.num_runs)
+    endvals = np.zeros((args.num_runs, args.num_evaluate), dtype=np.float32)
+    gs = np.zeros(args.num_runs, dtype=np.float32)
 
     for j in range(args.num_runs):
         print(j + 1)
@@ -163,8 +168,9 @@ def main(args):
             obs = np.stack(
                 [(t / args.n) * np.ones(args.num_evaluate), (prices[j, t, :] - args.s0) / args.s0,
                  quantity[j, t, :] / args.units],
-                axis=-1)
+                axis=-1).astype(np.float32)
             actions, _states = models[j].predict(obs, deterministic=True)
+            actions = (args.amax - args.amin) / (1 + np.exp(-args.sigmoid_param * actions)) + args.amin
             prices[j, t + 1, :], cash[j, t + 1, :], quantity[j, t + 1, :] = step(prices[j, t, :], cash[j, t, :],
                                                                                  quantity[j, t, :], actions.squeeze(),
                                                                                  args,

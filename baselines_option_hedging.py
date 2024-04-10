@@ -7,7 +7,7 @@ import torch
 
 from option_hedging import add_parameters, step, end_value
 
-torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float32)
 
 
 def parse_args():
@@ -49,7 +49,7 @@ def main(args):
     # Saving the results
     data_dict = args.__dict__
     data_dict["endvals"] = endvals
-    pickle.dump(data_dict, open("results/baseline_option_hedging_{}.pkl".format(timestamp), "wb"))
+    pickle.dump(data_dict, open("results/no_hedging_option_hedging_{}.pkl".format(timestamp), "wb"))
 
     print('DELTA HEDGING')
     prices = torch.zeros(args.num_runs, args.n + 1, args.num_evaluate)
