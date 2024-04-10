@@ -8,7 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-torch.set_default_dtype(torch.float64)
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+torch.set_default_dtype(torch.float32)
 
 
 def parse_args():
@@ -19,9 +20,8 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--num_evaluate', type=int, default=int(1e5))
     parser.add_argument('--gradient_type', type=str, default="complete", choices=["complete", "naive"])
-    parser.add_argument('--objective', type=str, default="exponential", choices=["cost", "forsyth", "exponential"])
+    parser.add_argument('--objective', type=str, default="cost", choices=["cost", "exponential"])
     parser.add_argument('--device', type=str, default="-1", choices=["-1", "0", "1"])
-    parser.add_argument('--gamma', type=float, default=0.0)
     parser.add_argument('--exp_param', type=float, default=2e-7)
     return parser.parse_args()
 
@@ -64,12 +64,7 @@ def compute_objective(endvals, args, using_torch=True):
     :param using_torch: boolean of whether to use torch or numpy
     :return: array of values of the objective function
     """
-    if args.objective == "forsyth":
-        if using_torch:
-            gs = torch.square(endvals / args.units - args.gamma / 2)
-        else:
-            gs = np.square(endvals / args.units - args.gamma / 2)
-    elif args.objective == "cost":
+    if args.objective == "cost":
         gs = - endvals / args.units
     elif args.objective == "exponential":
         if using_torch:
